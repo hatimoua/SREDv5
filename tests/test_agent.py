@@ -3,10 +3,18 @@ import json
 import hashlib
 from unittest.mock import MagicMock, patch
 from sqlmodel import Session, SQLModel, create_engine, select
-from sred.models.core import Run, File, Person, RateStatus, Segment, SegmentStatus
+from sred.models.core import Run, RunStatus, File, Person, RateStatus, Segment, SegmentStatus
 from sred.models.hypothesis import Hypothesis, HypothesisType, HypothesisStatus
 from sred.models.memory import MemoryDoc
 from sred.models.agent_log import ToolCallLog, LLMCallLog
+from sred.models.world import (
+    Contradiction, ContradictionSeverity, ContradictionType, ContradictionStatus,
+    ReviewTask, ReviewTaskStatus, ReviewDecision, DecisionLock,
+)
+from sred.gates import (
+    get_blocking_contradictions, get_open_blocking_tasks,
+    has_active_lock, update_run_gate_status,
+)
 from sred.agent.registry import get_openai_tools_schema, get_tool_handler, TOOL_REGISTRY
 from sred.agent.tools import (
     _people_list,
@@ -117,51 +125,239 @@ def test_people_get_wrong_run(session, run):
 
 
 # ---------------------------------------------------------------------------
-# tasks tools
+# tasks tools (ReviewTask-based)
 # ---------------------------------------------------------------------------
 def test_tasks_create_and_list(session, run):
-    result = _tasks_create(session, run.id, task_type="CSV_SCHEMA", description="Check CSV mapping")
-    assert "id" in result
-    assert result["type"] == "CSV_SCHEMA"
+    result = _tasks_create(
+        session, run.id,
+        issue_key="TEST:task:1",
+        title="Check CSV mapping",
+        description="Verify column mapping is correct",
+    )
+    assert result["status"] == "created"
+    assert "task_id" in result
 
     listing = _tasks_list_open(session, run.id)
     assert listing["count"] == 1
-    assert listing["tasks"][0]["description"] == "Check CSV mapping"
+    assert listing["tasks"][0]["issue_key"] == "TEST:task:1"
 
 
-def test_tasks_create_invalid_type(session, run):
-    result = _tasks_create(session, run.id, task_type="INVALID", description="Bad")
-    assert "error" in result
+def test_tasks_create_dedupe(session, run):
+    """Same issue_key should not create a duplicate open task."""
+    r1 = _tasks_create(session, run.id, issue_key="DUP:1", title="T", description="D")
+    assert r1["status"] == "created"
+
+    r2 = _tasks_create(session, run.id, issue_key="DUP:1", title="T2", description="D2")
+    assert r2["status"] == "duplicate"
+    assert r2["task_id"] == r1["task_id"]
+
+
+def test_tasks_create_blocked_by_lock(session, run):
+    """Cannot create a task if a DecisionLock exists for the issue_key."""
+    # Create a decision + lock manually
+    decision = ReviewDecision(run_id=run.id, task_id=0, decision="resolved", decided_by="HUMAN")
+    session.add(decision)
+    session.commit()
+    session.refresh(decision)
+
+    lock = DecisionLock(run_id=run.id, issue_key="LOCKED:1", decision_id=decision.id, reason="Done", active=True)
+    session.add(lock)
+    session.commit()
+
+    result = _tasks_create(session, run.id, issue_key="LOCKED:1", title="T", description="D")
+    assert result["status"] == "locked"
 
 
 # ---------------------------------------------------------------------------
-# contradictions tools
+# contradictions tools (Contradiction model)
 # ---------------------------------------------------------------------------
 def test_contradictions_create_and_list(session, run):
-    result = _contradictions_create(session, run.id, description="Hours mismatch")
-    assert "id" in result
-    assert "[CONTRADICTION]" in result["description"]
+    result = _contradictions_create(
+        session, run.id,
+        issue_key="PAYROLL_MISMATCH:Q1",
+        contradiction_type="PAYROLL_MISMATCH",
+        severity="BLOCKING",
+        description="Payroll totals differ by 12%",
+    )
+    assert result["status"] == "created"
+    assert "contradiction_id" in result
 
     listing = _contradictions_list_open(session, run.id)
     assert listing["count"] == 1
+    assert listing["contradictions"][0]["issue_key"] == "PAYROLL_MISMATCH:Q1"
+
+
+def test_contradictions_create_dedupe(session, run):
+    r1 = _contradictions_create(
+        session, run.id, issue_key="X:1",
+        contradiction_type="OTHER", severity="LOW", description="A",
+    )
+    r2 = _contradictions_create(
+        session, run.id, issue_key="X:1",
+        contradiction_type="OTHER", severity="LOW", description="B",
+    )
+    assert r1["status"] == "created"
+    assert r2["status"] == "duplicate"
+
+
+def test_contradictions_create_blocked_by_lock(session, run):
+    decision = ReviewDecision(run_id=run.id, task_id=0, decision="ok", decided_by="HUMAN")
+    session.add(decision)
+    session.commit()
+    session.refresh(decision)
+
+    lock = DecisionLock(run_id=run.id, issue_key="LOCKED:C", decision_id=decision.id, reason="Done", active=True)
+    session.add(lock)
+    session.commit()
+
+    result = _contradictions_create(
+        session, run.id, issue_key="LOCKED:C",
+        contradiction_type="OTHER", severity="LOW", description="X",
+    )
+    assert result["status"] == "locked"
 
 
 # ---------------------------------------------------------------------------
-# locks tool
+# locks tool (DecisionLock model)
 # ---------------------------------------------------------------------------
 def test_locks_list(session, run):
-    hyp = Hypothesis(
-        run_id=run.id,
-        type=HypothesisType.CSV_SCHEMA,
-        description="Locked mapping",
-        status=HypothesisStatus.ACCEPTED,
-    )
-    session.add(hyp)
+    decision = ReviewDecision(run_id=run.id, task_id=0, decision="ok", decided_by="HUMAN")
+    session.add(decision)
+    session.commit()
+    session.refresh(decision)
+
+    lock = DecisionLock(run_id=run.id, issue_key="LOCK:1", decision_id=decision.id, reason="Approved", active=True)
+    session.add(lock)
     session.commit()
 
     result = _locks_list_active(session, run.id)
     assert result["count"] == 1
-    assert result["locks"][0]["description"] == "Locked mapping"
+    assert result["locks"][0]["issue_key"] == "LOCK:1"
+
+
+# ---------------------------------------------------------------------------
+# Gate logic
+# ---------------------------------------------------------------------------
+def test_gate_no_blockers(session, run):
+    """No blockers -> status stays as-is."""
+    status = update_run_gate_status(session, run.id)
+    assert status == RunStatus.INITIALIZING  # unchanged
+
+
+def test_gate_blocking_contradiction_triggers_needs_review(session, run):
+    c = Contradiction(
+        run_id=run.id, issue_key="BLOCK:1",
+        contradiction_type=ContradictionType.PAYROLL_MISMATCH,
+        severity=ContradictionSeverity.BLOCKING,
+        description="Big mismatch",
+    )
+    session.add(c)
+    session.commit()
+
+    status = update_run_gate_status(session, run.id)
+    assert status == RunStatus.NEEDS_REVIEW
+
+    session.refresh(run)
+    assert run.status == RunStatus.NEEDS_REVIEW
+
+
+def test_gate_blocking_task_triggers_needs_review(session, run):
+    task = ReviewTask(
+        run_id=run.id, issue_key="BLOCK:T1",
+        title="Fix rate", description="Missing rate",
+        severity=ContradictionSeverity.BLOCKING,
+    )
+    session.add(task)
+    session.commit()
+
+    status = update_run_gate_status(session, run.id)
+    assert status == RunStatus.NEEDS_REVIEW
+
+
+def test_gate_resolving_blockers_clears_needs_review(session, run):
+    c = Contradiction(
+        run_id=run.id, issue_key="BLOCK:2",
+        contradiction_type=ContradictionType.MISSING_RATE,
+        severity=ContradictionSeverity.BLOCKING,
+        description="No rate for Alice",
+    )
+    session.add(c)
+    session.commit()
+
+    update_run_gate_status(session, run.id)
+    session.refresh(run)
+    assert run.status == RunStatus.NEEDS_REVIEW
+
+    # Resolve it
+    c.status = ContradictionStatus.RESOLVED
+    session.add(c)
+    session.commit()
+
+    status = update_run_gate_status(session, run.id)
+    assert status == RunStatus.PROCESSING
+
+
+def test_has_active_lock(session, run):
+    assert not has_active_lock(session, run.id, "KEY:1")
+
+    decision = ReviewDecision(run_id=run.id, task_id=0, decision="ok", decided_by="HUMAN")
+    session.add(decision)
+    session.commit()
+    session.refresh(decision)
+
+    lock = DecisionLock(run_id=run.id, issue_key="KEY:1", decision_id=decision.id, reason="Done", active=True)
+    session.add(lock)
+    session.commit()
+
+    assert has_active_lock(session, run.id, "KEY:1")
+    assert not has_active_lock(session, run.id, "KEY:2")
+
+
+def test_supersede_lock(session, run):
+    """Superseding a lock deactivates old, creates new active lock."""
+    decision1 = ReviewDecision(run_id=run.id, task_id=0, decision="first", decided_by="HUMAN")
+    session.add(decision1)
+    session.commit()
+    session.refresh(decision1)
+
+    lock1 = DecisionLock(run_id=run.id, issue_key="SUP:1", decision_id=decision1.id, reason="First", active=True)
+    session.add(lock1)
+    session.commit()
+    session.refresh(lock1)
+
+    # Supersede
+    lock1.active = False
+    session.add(lock1)
+
+    decision2 = ReviewDecision(run_id=run.id, task_id=0, decision="override", decided_by="HUMAN")
+    session.add(decision2)
+    session.commit()
+    session.refresh(decision2)
+
+    lock2 = DecisionLock(run_id=run.id, issue_key="SUP:1", decision_id=decision2.id, reason="Override", active=True)
+    session.add(lock2)
+    session.commit()
+
+    # Old lock inactive, new lock active
+    session.refresh(lock1)
+    assert lock1.active is False
+    assert lock2.active is True
+    assert has_active_lock(session, run.id, "SUP:1")
+
+
+def test_non_blocking_contradiction_does_not_trigger_gate(session, run):
+    """LOW severity contradiction should not trigger NEEDS_REVIEW."""
+    c = Contradiction(
+        run_id=run.id, issue_key="LOW:1",
+        contradiction_type=ContradictionType.OTHER,
+        severity=ContradictionSeverity.LOW,
+        description="Minor issue",
+    )
+    session.add(c)
+    session.commit()
+
+    status = update_run_gate_status(session, run.id)
+    assert status != RunStatus.NEEDS_REVIEW
 
 
 # ---------------------------------------------------------------------------

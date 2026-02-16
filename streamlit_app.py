@@ -32,6 +32,7 @@ pg = st.navigation([
     st.Page("src/sred/ui/pages/3_uploads.py", title="Uploads", icon="📂"),
     st.Page("src/sred/ui/pages/4_dashboard.py", title="Dashboard", icon="📊"),
     st.Page("src/sred/ui/pages/7_agent.py", title="Agent Runner", icon="🤖"),
+    st.Page("src/sred/ui/pages/8_tasks.py", title="Tasks & Gates", icon="🚦"),
 ])
 
 pg.run()

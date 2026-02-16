@@ -14,7 +14,7 @@ def init_db():
     
     # Import all models here so SQLModel knows about them
     # This is critical for create_all to work
-    from sred.models import core, vector, memory, artifact, finance, agent_log  # noqa: F401
+    from sred.models import core, vector, memory, artifact, finance, agent_log, world  # noqa: F401
     
     logger.info(f"Initializing database at {DB_URL}")
     SQLModel.metadata.create_all(engine)

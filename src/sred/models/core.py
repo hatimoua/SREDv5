@@ -7,6 +7,7 @@ from sred.models.base import TimestampMixin, ProvenanceMixin
 class RunStatus(str, Enum):
     INITIALIZING = "INITIALIZING"
     PROCESSING = "PROCESSING"
+    NEEDS_REVIEW = "NEEDS_REVIEW"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
 

@@ -15,6 +15,11 @@ from sred.models.core import File, Segment, Person, Run, RateStatus
 from sred.models.finance import StagingRow
 from sred.models.memory import MemoryDoc
 from sred.models.hypothesis import Hypothesis, StagingMappingProposal, HypothesisStatus
+from sred.models.world import (
+    Contradiction, ContradictionSeverity, ContradictionType, ContradictionStatus,
+    ReviewTask, ReviewTaskStatus, ReviewDecision, DecisionLock,
+)
+from sred.gates import has_active_lock, update_run_gate_status
 from sred.db import DATA_DIR
 from sred.logging import logger
 from sred.agent.registry import register_tool
@@ -224,33 +229,40 @@ register_tool(
 
 
 # ---------------------------------------------------------------------------
-# tasks.list_open
+# tasks.list_open  (ReviewTask-based)
 # ---------------------------------------------------------------------------
 def _tasks_list_open(session: Session, run_id: int, *, severity: str = "all") -> dict:
-    """List open hypotheses (tasks) for the run, optionally filtered by status."""
-    stmt = select(Hypothesis).where(
-        Hypothesis.run_id == run_id,
-        Hypothesis.status == HypothesisStatus.ACTIVE,
+    """List open review tasks for the run, optionally filtered by severity."""
+    stmt = select(ReviewTask).where(
+        ReviewTask.run_id == run_id,
+        ReviewTask.status == ReviewTaskStatus.OPEN,
     )
-    hyps = session.exec(stmt).all()
-    items = []
-    for h in hyps:
-        items.append({
-            "id": h.id,
-            "type": h.type.value,
-            "description": h.description,
-            "status": h.status.value,
-        })
+    if severity != "all":
+        sev = ContradictionSeverity(severity) if severity in ContradictionSeverity.__members__ else None
+        if sev:
+            stmt = stmt.where(ReviewTask.severity == sev)
+
+    tasks = session.exec(stmt).all()
+    items = [
+        {
+            "id": t.id,
+            "issue_key": t.issue_key,
+            "title": t.title,
+            "severity": t.severity.value,
+            "status": t.status.value,
+        }
+        for t in tasks
+    ]
     return {"count": len(items), "tasks": items}
 
 
 register_tool(
     name="tasks_list_open",
-    description="List open/active tasks (hypotheses) for the current run.",
+    description="List open review tasks for the current run. Optionally filter by severity (LOW, MEDIUM, HIGH, BLOCKING).",
     parameters={
         "type": "object",
         "properties": {
-            "severity": {"type": "string", "description": "Filter by severity (unused for now, returns all active)."},
+            "severity": {"type": "string", "description": "Filter: LOW, MEDIUM, HIGH, BLOCKING, or 'all' (default)."},
         },
         "required": [],
     },
@@ -259,124 +271,196 @@ register_tool(
 
 
 # ---------------------------------------------------------------------------
-# tasks.create
+# tasks.create  (ReviewTask-based, deduped by issue_key, lock-aware)
 # ---------------------------------------------------------------------------
-def _tasks_create(session: Session, run_id: int, *, task_type: str, description: str) -> dict:
-    """Create a new hypothesis/task."""
-    from sred.models.hypothesis import HypothesisType
+def _tasks_create(
+    session: Session,
+    run_id: int,
+    *,
+    issue_key: str,
+    title: str,
+    description: str,
+    severity: str = "MEDIUM",
+    contradiction_id: int | None = None,
+) -> dict:
+    """Create a review task. Deduped by issue_key; blocked if a lock exists."""
+    # Check lock
+    if has_active_lock(session, run_id, issue_key):
+        return {"status": "locked", "issue_key": issue_key, "message": "A DecisionLock exists for this issue. Cannot re-open."}
 
-    # Validate type
-    valid_types = {t.value for t in HypothesisType}
-    if task_type not in valid_types:
-        return {"error": f"Invalid task_type '{task_type}'. Valid: {sorted(valid_types)}"}
+    # Check existing open task with same key
+    existing = session.exec(
+        select(ReviewTask).where(
+            ReviewTask.run_id == run_id,
+            ReviewTask.issue_key == issue_key,
+            ReviewTask.status == ReviewTaskStatus.OPEN,
+        )
+    ).first()
+    if existing:
+        return {"status": "duplicate", "task_id": existing.id, "issue_key": issue_key}
 
-    hyp = Hypothesis(
+    sev = ContradictionSeverity(severity) if severity in ContradictionSeverity.__members__ else ContradictionSeverity.MEDIUM
+    task = ReviewTask(
         run_id=run_id,
-        type=HypothesisType(task_type),
+        issue_key=issue_key,
+        title=title,
         description=description,
-        status=HypothesisStatus.ACTIVE,
+        severity=sev,
+        contradiction_id=contradiction_id,
     )
-    session.add(hyp)
+    session.add(task)
     session.commit()
-    session.refresh(hyp)
-    return {"id": hyp.id, "type": hyp.type.value, "description": hyp.description}
+    session.refresh(task)
+
+    # Re-evaluate gate
+    update_run_gate_status(session, run_id)
+
+    return {"status": "created", "task_id": task.id, "issue_key": issue_key}
 
 
 register_tool(
     name="tasks_create",
-    description="Create a new task (hypothesis) for the current run.",
+    description="Create a review task for human attention. Deduped by issue_key; blocked if a DecisionLock exists for that key.",
     parameters={
         "type": "object",
         "properties": {
-            "task_type": {"type": "string", "description": "Type of task: CSV_SCHEMA or CLAIM_CLUSTERING."},
-            "description": {"type": "string", "description": "Human-readable description of the task."},
+            "issue_key": {"type": "string", "description": "Unique key, e.g. 'MISSING_RATE:person:3'."},
+            "title": {"type": "string", "description": "Short title."},
+            "description": {"type": "string", "description": "Detailed description."},
+            "severity": {"type": "string", "description": "LOW, MEDIUM, HIGH, or BLOCKING. Default MEDIUM."},
+            "contradiction_id": {"type": "integer", "description": "Optional linked Contradiction ID."},
         },
-        "required": ["task_type", "description"],
+        "required": ["issue_key", "title", "description"],
     },
     handler=_tasks_create,
 )
 
 
 # ---------------------------------------------------------------------------
-# contradictions.list_open
+# contradictions.list_open  (Contradiction model)
 # ---------------------------------------------------------------------------
 def _contradictions_list_open(session: Session, run_id: int) -> dict:
-    """List open contradictions (REJECTED hypotheses that need attention)."""
-    stmt = select(Hypothesis).where(
-        Hypothesis.run_id == run_id,
-        Hypothesis.status == HypothesisStatus.REJECTED,
-    )
-    hyps = session.exec(stmt).all()
-    items = [
-        {"id": h.id, "type": h.type.value, "description": h.description}
-        for h in hyps
-    ]
-    return {"count": len(items), "contradictions": items}
+    """List open contradictions."""
+    items = session.exec(
+        select(Contradiction).where(
+            Contradiction.run_id == run_id,
+            Contradiction.status == ContradictionStatus.OPEN,
+        )
+    ).all()
+    return {
+        "count": len(items),
+        "contradictions": [
+            {
+                "id": c.id,
+                "issue_key": c.issue_key,
+                "type": c.contradiction_type.value,
+                "severity": c.severity.value,
+                "description": c.description,
+            }
+            for c in items
+        ],
+    }
 
 
 register_tool(
     name="contradictions_list_open",
-    description="List open contradictions (rejected hypotheses) that may need resolution.",
+    description="List open contradictions for the current run.",
     parameters={"type": "object", "properties": {}, "required": []},
     handler=_contradictions_list_open,
 )
 
 
 # ---------------------------------------------------------------------------
-# contradictions.create
+# contradictions.create  (Contradiction model, deduped by issue_key, lock-aware)
 # ---------------------------------------------------------------------------
-def _contradictions_create(session: Session, run_id: int, *, description: str, parent_id: int | None = None) -> dict:
-    """Create a contradiction record (a rejected hypothesis)."""
-    from sred.models.hypothesis import HypothesisType
+def _contradictions_create(
+    session: Session,
+    run_id: int,
+    *,
+    issue_key: str,
+    contradiction_type: str,
+    severity: str,
+    description: str,
+    related_entity_type: str | None = None,
+    related_entity_id: int | None = None,
+) -> dict:
+    """Create a contradiction. Deduped by issue_key; blocked if a lock exists."""
+    if has_active_lock(session, run_id, issue_key):
+        return {"status": "locked", "issue_key": issue_key, "message": "A DecisionLock exists. Cannot re-open."}
 
-    hyp = Hypothesis(
+    existing = session.exec(
+        select(Contradiction).where(
+            Contradiction.run_id == run_id,
+            Contradiction.issue_key == issue_key,
+            Contradiction.status == ContradictionStatus.OPEN,
+        )
+    ).first()
+    if existing:
+        return {"status": "duplicate", "contradiction_id": existing.id, "issue_key": issue_key}
+
+    ct = ContradictionType(contradiction_type) if contradiction_type in ContradictionType.__members__ else ContradictionType.OTHER
+    sev = ContradictionSeverity(severity) if severity in ContradictionSeverity.__members__ else ContradictionSeverity.MEDIUM
+
+    c = Contradiction(
         run_id=run_id,
-        type=HypothesisType.CLAIM_CLUSTERING,
-        description=f"[CONTRADICTION] {description}",
-        status=HypothesisStatus.REJECTED,
-        parent_id=parent_id,
+        issue_key=issue_key,
+        contradiction_type=ct,
+        severity=sev,
+        description=description,
+        related_entity_type=related_entity_type,
+        related_entity_id=related_entity_id,
     )
-    session.add(hyp)
+    session.add(c)
     session.commit()
-    session.refresh(hyp)
-    return {"id": hyp.id, "description": hyp.description}
+    session.refresh(c)
+
+    update_run_gate_status(session, run_id)
+
+    return {"status": "created", "contradiction_id": c.id, "issue_key": issue_key}
 
 
 register_tool(
     name="contradictions_create",
-    description="Flag a contradiction or data conflict for human review.",
+    description="Flag a contradiction/data conflict. Deduped by issue_key; blocked if a DecisionLock exists.",
     parameters={
         "type": "object",
         "properties": {
-            "description": {"type": "string", "description": "Description of the contradiction."},
-            "parent_id": {"type": "integer", "description": "Optional parent hypothesis ID."},
+            "issue_key": {"type": "string", "description": "Unique key, e.g. 'PAYROLL_MISMATCH:2024-Q1'."},
+            "contradiction_type": {"type": "string", "description": "MISSING_RATE, PAYROLL_MISMATCH, UNKNOWN_BASIS, MISSING_EVIDENCE, or OTHER."},
+            "severity": {"type": "string", "description": "LOW, MEDIUM, HIGH, or BLOCKING."},
+            "description": {"type": "string", "description": "Detailed description."},
+            "related_entity_type": {"type": "string", "description": "Optional: entity type, e.g. 'Person'."},
+            "related_entity_id": {"type": "integer", "description": "Optional: entity ID."},
         },
-        "required": ["description"],
+        "required": ["issue_key", "contradiction_type", "severity", "description"],
     },
     handler=_contradictions_create,
 )
 
 
 # ---------------------------------------------------------------------------
-# locks.list_active
+# locks.list_active  (DecisionLock model)
 # ---------------------------------------------------------------------------
 def _locks_list_active(session: Session, run_id: int) -> dict:
-    """List active locks (accepted hypotheses that are frozen)."""
-    stmt = select(Hypothesis).where(
-        Hypothesis.run_id == run_id,
-        Hypothesis.status == HypothesisStatus.ACCEPTED,
-    )
-    hyps = session.exec(stmt).all()
-    items = [
-        {"id": h.id, "type": h.type.value, "description": h.description}
-        for h in hyps
-    ]
-    return {"count": len(items), "locks": items}
+    """List active decision locks."""
+    locks = session.exec(
+        select(DecisionLock).where(
+            DecisionLock.run_id == run_id,
+            DecisionLock.active == True,  # noqa: E712
+        )
+    ).all()
+    return {
+        "count": len(locks),
+        "locks": [
+            {"id": lk.id, "issue_key": lk.issue_key, "reason": lk.reason}
+            for lk in locks
+        ],
+    }
 
 
 register_tool(
     name="locks_list_active",
-    description="List accepted/locked hypotheses that should not be modified.",
+    description="List active decision locks. The agent must not re-open issues with active locks.",
     parameters={"type": "object", "properties": {}, "required": []},
     handler=_locks_list_active,
 )
