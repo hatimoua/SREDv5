@@ -8,10 +8,14 @@ import json
 import time
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
-from sqlmodel import Session
+from sqlmodel import Session, select, func
 from sred.config import settings
 from sred.llm.openai_client import client
 from sred.models.agent_log import ToolCallLog, LLMCallLog
+from sred.models.core import Run, Person, File, RateStatus, FileStatus
+from sred.models.finance import StagingRow, StagingRowType
+from sred.models.alias import PersonAlias, AliasStatus
+from sred.models.world import Contradiction, ContradictionStatus, ReviewTask, ReviewTaskStatus, DecisionLock
 from sred.agent.registry import get_openai_tools_schema, get_tool_handler
 from sred.logging import logger
 
@@ -27,6 +31,7 @@ You have access to tools for:
 - Searching extracted text segments
 - Profiling and querying CSV data via DuckDB
 - Managing people (employees/contractors)
+- Resolving person-name aliases (entity resolution)
 - Creating and listing tasks (hypotheses)
 - Flagging contradictions for human review
 - Checking locked decisions
@@ -38,6 +43,76 @@ Rules:
 - When uncertain, create a task or contradiction for human review rather than guessing.
 - Explain your reasoning briefly before each tool call.
 """
+
+
+def build_run_context(session: Session, run_id: int) -> str:
+    """Build a dynamic context block describing the current run state.
+
+    Returns a concise multi-line string suitable for injection into the
+    system prompt so the agent knows its immediate situation.
+    """
+    run = session.get(Run, run_id)
+    if not run:
+        return ""
+
+    lines: list[str] = [f"Run: #{run.id} \"{run.name}\" — status: {run.status.value}"]
+
+    # People
+    people = session.exec(select(Person).where(Person.run_id == run_id)).all()
+    pending_rates = [p for p in people if p.rate_status == RateStatus.PENDING]
+    lines.append(f"People: {len(people)} total, {len(pending_rates)} with PENDING rate")
+
+    # Files
+    files = session.exec(select(File).where(File.run_id == run_id)).all()
+    processed = sum(1 for f in files if f.status == FileStatus.PROCESSED)
+    lines.append(f"Files: {len(files)} uploaded, {processed} processed")
+
+    # Staging rows
+    ts_count = session.exec(
+        select(func.count(StagingRow.id)).where(
+            StagingRow.run_id == run_id,
+            StagingRow.row_type == StagingRowType.TIMESHEET,
+        )
+    ).one()
+    lines.append(f"Timesheet staging rows: {ts_count}")
+
+    # Aliases
+    alias_confirmed = session.exec(
+        select(func.count(PersonAlias.id)).where(
+            PersonAlias.run_id == run_id,
+            PersonAlias.status == AliasStatus.CONFIRMED,
+        )
+    ).one()
+    alias_total = session.exec(
+        select(func.count(PersonAlias.id)).where(PersonAlias.run_id == run_id)
+    ).one()
+    lines.append(f"Person aliases: {alias_confirmed} confirmed / {alias_total} total")
+
+    # Open contradictions & tasks
+    open_contradictions = session.exec(
+        select(func.count(Contradiction.id)).where(
+            Contradiction.run_id == run_id,
+            Contradiction.status == ContradictionStatus.OPEN,
+        )
+    ).one()
+    open_tasks = session.exec(
+        select(func.count(ReviewTask.id)).where(
+            ReviewTask.run_id == run_id,
+            ReviewTask.status == ReviewTaskStatus.OPEN,
+        )
+    ).one()
+    lines.append(f"Open contradictions: {open_contradictions}, open tasks: {open_tasks}")
+
+    # Active locks
+    active_locks = session.exec(
+        select(func.count(DecisionLock.id)).where(
+            DecisionLock.run_id == run_id,
+            DecisionLock.active == True,  # noqa: E712
+        )
+    ).one()
+    lines.append(f"Active decision locks: {active_locks}")
+
+    return "\n".join(lines)
 
 
 @dataclass
@@ -107,6 +182,7 @@ def run_agent_loop(
     run_id: int,
     user_message: str,
     max_steps: int = 10,
+    context_notes: str | None = None,
 ) -> AgentResult:
     """
     Execute the agent loop.
@@ -114,13 +190,30 @@ def run_agent_loop(
     1. Send user message + tool schemas to OpenAI.
     2. If the model returns tool_calls, execute them and feed results back.
     3. Repeat until the model returns a plain text response or max_steps reached.
+
+    Args:
+        context_notes: Optional caller-supplied context (e.g. "We are currently
+            resolving identities for File #12"). Injected into the system prompt
+            alongside the auto-generated run snapshot.
     """
     result = AgentResult()
     model = settings.OPENAI_MODEL_AGENT
     tools_schema = get_openai_tools_schema()
 
+    # --- Dynamic system prompt ---
+    prompt_parts = [SYSTEM_PROMPT]
+
+    run_ctx = build_run_context(session, run_id)
+    if run_ctx:
+        prompt_parts.append(f"## Current Run State\n{run_ctx}")
+
+    if context_notes:
+        prompt_parts.append(f"## Immediate Goal\n{context_notes}")
+
+    system_content = "\n\n".join(prompt_parts)
+
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_content},
         {"role": "user", "content": user_message},
     ]
 

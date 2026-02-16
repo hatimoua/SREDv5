@@ -17,6 +17,11 @@ st.subheader("Run Agent")
 
 max_steps = st.slider("Max Steps", min_value=1, max_value=20, value=5)
 user_msg = st.text_area("Instruction for the agent", height=120, placeholder="e.g. Process all uploaded files, then profile the CSVs and summarise findings.")
+context_notes = st.text_input(
+    "Context notes (optional)",
+    placeholder="e.g. We are currently resolving identities for File #12",
+    help="Injected into the system prompt so the agent knows its immediate goal.",
+)
 
 if st.button("Run Agent", type="primary"):
     if not user_msg.strip():
@@ -26,7 +31,11 @@ if st.button("Run Agent", type="primary"):
 
         with Session(engine) as session:
             with st.spinner("Agent is working..."):
-                result = run_agent_loop(session, run_id, user_msg.strip(), max_steps=max_steps)
+                result = run_agent_loop(
+                    session, run_id, user_msg.strip(),
+                    max_steps=max_steps,
+                    context_notes=context_notes.strip() or None,
+                )
 
         # --- Display trace ---
         st.divider()
