@@ -1,0 +1,45 @@
+[project]
+name = "sred"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "hatimoua", email = "hatimoua@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "duckdb>=1.4.4",
+    "loguru>=0.7.3",
+    "numpy>=2.4.2",
+    "openai>=2.21.0",
+    "pandas>=2.3.3",
+    "pdf2image>=1.17.0",
+    "pillow>=12.1.1",
+    "pydantic>=2.12.5",
+    "pydantic-settings>=2.13.0",
+    "python-docx>=1.2.0",
+    "python-dotenv>=1.2.1",
+    "sqlmodel>=0.0.33",
+    "streamlit>=1.54.0",
+    "typer==0.12.5",
+]
+
+[project.scripts]
+sred = "sred.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sred"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0.0",
+]

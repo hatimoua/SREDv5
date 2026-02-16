@@ -1,0 +1,40 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+venv/
+ENV/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Database and local data
+data/*.db
+data/runs/
+*.sqlite
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE settings
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Log files
+*.log
