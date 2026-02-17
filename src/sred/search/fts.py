@@ -34,13 +34,22 @@ def setup_fts():
         session.commit()
 
 def reindex_all():
-    """Rebuild FTS index from source tables."""
+    """Rebuild FTS index from source tables.
+
+    Drops and recreates the FTS5 virtual tables to handle corruption,
+    then repopulates from the source tables.
+    """
     logger.info("Reindexing FTS5 tables...")
     with Session(engine) as session:
-        # Clear existing
-        session.exec(text("DELETE FROM segment_fts;"))
-        session.exec(text("DELETE FROM memory_fts;"))
-        
+        # Drop and recreate to handle any corruption
+        session.exec(text("DROP TABLE IF EXISTS segment_fts;"))
+        session.exec(text("DROP TABLE IF EXISTS memory_fts;"))
+        session.commit()
+
+    # Recreate the virtual tables
+    setup_fts()
+
+    with Session(engine) as session:
         # Re-insert Segments
         session.exec(text("""
             INSERT INTO segment_fts(rowid, id, content)

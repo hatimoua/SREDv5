@@ -6,6 +6,7 @@ Logs every LLM call and tool invocation to the database.
 """
 import json
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Optional
 from sqlmodel import Session, select, func
@@ -136,7 +137,7 @@ class AgentResult:
     stopped_reason: str = ""  # "complete", "max_steps", "error"
 
 
-def _log_llm_call(session: Session, run_id: int, model: str, messages: list, response) -> None:
+def _log_llm_call(session: Session, run_id: int, model: str, messages: list, response, session_id: str | None = None) -> None:
     """Persist an LLM call summary to the database."""
     usage = response.usage
     tool_calls = response.choices[0].message.tool_calls or []
@@ -150,6 +151,7 @@ def _log_llm_call(session: Session, run_id: int, model: str, messages: list, res
 
     log = LLMCallLog(
         run_id=run_id,
+        session_id=session_id,
         model=model,
         prompt_summary=prompt_summary,
         message_count=len(messages),
@@ -163,10 +165,11 @@ def _log_llm_call(session: Session, run_id: int, model: str, messages: list, res
     session.commit()
 
 
-def _log_tool_call(session: Session, run_id: int, tool_name: str, args_json: str, result: dict, success: bool, duration_ms: int) -> None:
+def _log_tool_call(session: Session, run_id: int, tool_name: str, args_json: str, result: dict, success: bool, duration_ms: int, session_id: str | None = None) -> None:
     """Persist a tool call to the database."""
     log = ToolCallLog(
         run_id=run_id,
+        session_id=session_id,
         tool_name=tool_name,
         arguments_json=args_json,
         result_json=json.dumps(result, default=str)[:4000],
@@ -199,6 +202,7 @@ def run_agent_loop(
     result = AgentResult()
     model = settings.OPENAI_MODEL_AGENT
     tools_schema = get_openai_tools_schema()
+    session_id = str(uuid.uuid4())
 
     # --- Dynamic system prompt ---
     prompt_parts = [SYSTEM_PROMPT]
@@ -232,7 +236,7 @@ def run_agent_loop(
             break
 
         # Log the LLM call
-        _log_llm_call(session, run_id, model, messages, response)
+        _log_llm_call(session, run_id, model, messages, response, session_id=session_id)
 
         choice = response.choices[0]
         assistant_msg = choice.message
@@ -297,7 +301,7 @@ def run_agent_loop(
             duration_ms = int((time.monotonic() - t0) * 1000)
 
             # Log tool call
-            _log_tool_call(session, run_id, tool_name, args_json, tool_result, success, duration_ms)
+            _log_tool_call(session, run_id, tool_name, args_json, tool_result, success, duration_ms, session_id=session_id)
 
             # Record step
             result.steps.append(AgentStep(

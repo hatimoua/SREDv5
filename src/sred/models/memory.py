@@ -3,6 +3,7 @@ from sqlmodel import Field, SQLModel
 from sred.models.base import TimestampMixin
 
 class MemoryDoc(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int # Scoped to a run
     path: str # e.g. "memory/summary.md" or "memory/decisions.md"

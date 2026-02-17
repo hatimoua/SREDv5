@@ -17,17 +17,19 @@ class SegmentStatus(str, Enum):
     ERROR = "ERROR"
 
 class Run(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str
     status: RunStatus = Field(default=RunStatus.INITIALIZING)
     
-    files: List["File"] = Relationship(back_populates="run")
+    files: List["File"] = Relationship(back_populates="run", sa_relationship_kwargs={"foreign_keys": "[File.run_id]"})
 
 class RateStatus(str, Enum):
     PENDING = "PENDING"
     SET = "SET"
 
 class Person(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
     
@@ -44,6 +46,7 @@ class FileStatus(str, Enum):
     ERROR = "ERROR"
 
 class File(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id")
     
@@ -59,10 +62,11 @@ class File(TimestampMixin, table=True):
     
     content_hash: str
     
-    run: Optional[Run] = Relationship(back_populates="files")
-    segments: List["Segment"] = Relationship(back_populates="file", sa_relationship_kwargs={"foreign_keys": "Segment.file_id"})
+    run: Optional[Run] = Relationship(back_populates="files", sa_relationship_kwargs={"foreign_keys": "[File.run_id]"})
+    segments: List["Segment"] = Relationship(back_populates="file", sa_relationship_kwargs={"foreign_keys": "[Segment.file_id]"})
 
 class Segment(TimestampMixin, ProvenanceMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     file_id: int = Field(foreign_key="file.id")
     # Denormalized run_id for scope efficiency
@@ -71,7 +75,7 @@ class Segment(TimestampMixin, ProvenanceMixin, table=True):
     content: str
     status: SegmentStatus = Field(default=SegmentStatus.PENDING)
     
-    file: Optional[File] = Relationship(back_populates="segments", sa_relationship_kwargs={"foreign_keys": "Segment.file_id"})
+    file: Optional[File] = Relationship(back_populates="segments", sa_relationship_kwargs={"foreign_keys": "[Segment.file_id]"})
     # Artifacts now link more loosely or via join table, but we'll remove the strict back_populates for now
     # or keep it if we update Artifact as well. 
     # For now, let's keep the relationship but we will update Artifact side next.

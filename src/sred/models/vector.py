@@ -12,6 +12,7 @@ class EntityType(str, Enum):
 class VectorEmbedding(TimestampMixin, table=True):
     __table_args__ = (
         UniqueConstraint("entity_type", "entity_id", "model", name="unique_embedding_per_model"),
+        {"extend_existing": True},
     )
     
     id: Optional[int] = Field(default=None, primary_key=True)

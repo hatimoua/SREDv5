@@ -35,6 +35,7 @@ class ContradictionStatus(str, Enum):
 
 
 class Contradiction(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
 
@@ -60,6 +61,7 @@ class ReviewTaskStatus(str, Enum):
 
 
 class ReviewTask(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
 
@@ -78,6 +80,7 @@ class ReviewTask(TimestampMixin, table=True):
 # ReviewDecision
 # ---------------------------------------------------------------------------
 class ReviewDecision(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
 
@@ -90,6 +93,7 @@ class ReviewDecision(TimestampMixin, table=True):
 # DecisionLock
 # ---------------------------------------------------------------------------
 class DecisionLock(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
 

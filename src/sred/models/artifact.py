@@ -12,6 +12,7 @@ class ArtifactKind(str, Enum):
     # Future kinds: ENTITY_EXTRACT, TECHNICAL_BLOCK
 
 class ExtractionArtifact(TimestampMixin, ProvenanceMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     file_id: int = Field(foreign_key="file.id")
     run_id: int = Field(foreign_key="run.id", index=True)

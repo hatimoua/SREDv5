@@ -5,8 +5,10 @@ from sred.models.base import TimestampMixin
 
 
 class ToolCallLog(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(index=True)
+    session_id: Optional[str] = Field(default=None, index=True, description="UUID grouping calls from one agent loop invocation")
 
     tool_name: str
     arguments_json: str  # JSON string of tool arguments
@@ -16,8 +18,10 @@ class ToolCallLog(TimestampMixin, table=True):
 
 
 class LLMCallLog(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(index=True)
+    session_id: Optional[str] = Field(default=None, index=True, description="UUID grouping calls from one agent loop invocation")
 
     model: str
     prompt_summary: str  # Truncated/summarised prompt for audit

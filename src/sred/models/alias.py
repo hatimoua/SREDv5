@@ -17,6 +17,7 @@ class PersonAlias(TimestampMixin, table=True):
     """
     __table_args__ = (
         UniqueConstraint("run_id", "alias", name="uq_person_alias_run_alias"),
+        {"extend_existing": True},
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)

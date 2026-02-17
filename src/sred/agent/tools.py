@@ -750,35 +750,39 @@ register_tool(
 # Payroll extraction prompt (structured JSON)
 # ---------------------------------------------------------------------------
 PAYROLL_EXTRACTION_PROMPT = """\
-Analyze the following text extracted from a payroll document.
-Extract ALL pay periods found in the document.
+You are extracting payroll data from a document that may contain multiple sections.
+Focus ONLY on sections that contain payroll, labour, salary, or wage information
+(e.g. tables titled "Payroll Summary", "Labour Costs", "SR&ED Labour", etc.).
+Ignore non-payroll sections such as invoices, cloud costs, or project descriptions.
 
-For each pay period, extract:
-- period_start: start date (YYYY-MM-DD)
+For each pay period you find, extract:
+- period_start: start date (YYYY-MM-DD) — look for "Claim period", "Pay period", date ranges
 - period_end: end date (YYYY-MM-DD)
-- total_hours: total hours worked (null if not present)
-- total_wages: total wages/salary amount (null if not present)
+- total_hours: total hours worked across ALL employees. If no explicit total row exists,
+  SUM the individual employee hours from columns like "Total Hrs", "Hours", "Hrs Worked".
+  Do NOT return null if individual employee hours are listed — always compute the sum.
+- total_wages: total wages/salary amount. Use the TOTAL row if present, otherwise sum individual amounts.
 - currency: currency code (default "CAD")
-- employee_count: number of employees listed (null if unclear)
+- employee_count: number of distinct employees listed
 - confidence: your confidence in this extraction (0.0 to 1.0)
 
 Return JSON:
 {{
     "periods": [
         {{
-            "period_start": "2025-01-01",
-            "period_end": "2025-01-15",
-            "total_hours": 320.0,
-            "total_wages": 12800.00,
+            "period_start": "2024-01-01",
+            "period_end": "2024-12-31",
+            "total_hours": 9024.0,
+            "total_wages": 718406.40,
             "currency": "CAD",
-            "employee_count": 4,
-            "confidence": 0.9
+            "employee_count": 10,
+            "confidence": 0.95
         }}
     ]
 }}
 
-If the document does not appear to be a payroll document, return:
-{{"periods": [], "error": "Not a payroll document"}}
+If there is absolutely NO payroll, labour, or wage data anywhere in the document, return:
+{{"periods": [], "error": "No payroll data found"}}
 
 Document text:
 {text}

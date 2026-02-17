@@ -17,6 +17,7 @@ class StagingRowType(str, Enum):
     JIRA = "JIRA"
 
 class StagingRow(TimestampMixin, ProvenanceMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(index=True)
     
@@ -30,6 +31,7 @@ class StagingRow(TimestampMixin, ProvenanceMixin, table=True):
     # Source file ID from ProvenanceMixin links back to original CSV
 
 class LedgerLabourHour(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(index=True)
     
@@ -54,6 +56,7 @@ class PayrollExtract(TimestampMixin, table=True):
     __table_args__ = (
         UniqueConstraint("run_id", "file_id", "period_start", "period_end",
                          name="uq_payroll_extract_period"),
+        {"extend_existing": True},
     )
 
     id: Optional[int] = Field(default=None, primary_key=True)

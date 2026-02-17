@@ -1,11 +1,98 @@
 # SR&ED Automation Platform — Comprehensive Handoff Document
 
-**Generated:** 2026-02-16  
-**Status:** Completed through **Increment 8** (of 12)  
-**Test suite:** 48 tests, all passing  
+**Generated:** 2026-02-17  
+**Status:** Completed through **Increment 10** (of 12)  
+**Test suite:** 84 tests, all passing  
 **Tooling:** Python 3.12+, uv, SQLite, SQLModel, Streamlit, OpenAI API, DuckDB
 
 > For the full product vision, optimization goals, and post-Prompt-12 roadmap, see `project.md` in the repo root.
+
+---
+
+## 0. Platform Overview — What This System Does
+
+### The Problem
+
+Canadian companies claiming the **Scientific Research & Experimental Development (SR&ED)** tax credit must assemble complex evidence packages: timesheets, payroll stubs, invoices, Jira exports, technical documents, and more. The evidence is messy, inconsistent, and spread across dozens of files. Preparing a claim today is a manual, error-prone process that takes consultants weeks of effort per client.
+
+### The Solution
+
+This platform is an **AI-powered SR&ED claim preparation system** that automates the heavy lifting while keeping humans in control of every consequential decision. It is **not** a one-pass parser — it is a **reasoning system** that:
+
+1. **Ingests** messy client evidence (CSV timesheets, PDF payroll stubs, DOCX technical docs, images, Jira exports)
+2. **Extracts** structured data using OCR/vision models and LLM-driven structured extraction
+3. **Builds a world model** — a consistent, queryable representation of people, hours, pay periods, contradictions, and evidence
+4. **Resolves ambiguity** through identity resolution (fuzzy name matching), schema mapping hypotheses, and human-in-the-loop review
+5. **Validates cross-source consistency** (e.g., payroll vs. timesheet totals) and flags mismatches as blocking contradictions
+6. **Computes scenario totals** for claimable labour hours at different confidence thresholds
+7. **Produces an auditable export package** with citations, narratives, and evidence provenance — but only after all blocking issues are resolved
+
+### End-to-End Workflow
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│  1. SETUP                                                           │
+│     Create a Run → Add People (name, role, hourly rate)             │
+│                                                                     │
+│  2. INGEST                                                          │
+│     Upload files (CSV, PDF, DOCX, TXT, images)                     │
+│     → Vision OCR for PDFs/images → ExtractionArtifacts              │
+│     → CSV profiling via DuckDB → StagingRows                        │
+│     → Text chunking → Segments (searchable)                         │
+│                                                                     │
+│  3. UNDERSTAND                                                      │
+│     Schema mapping: CSV columns → target fields (LLM hypotheses)    │
+│     Identity resolution: raw names → canonical Person records       │
+│       (fuzzy matching + human confirmation → PersonAlias)           │
+│     Hybrid search: FTS5 + vector embeddings + RRF fusion            │
+│                                                                     │
+│  4. VALIDATE                                                        │
+│     Payroll extraction: vision artifacts → structured pay periods    │
+│     Cross-validation: payroll hours vs. timesheet hours per period   │
+│     Mismatch > 5% → BLOCKING contradiction + ReviewTask             │
+│     Missing rates → BLOCKING contradiction                          │
+│     Run status → NEEDS_REVIEW until all blockers resolved           │
+│                                                                     │
+│  5. REVIEW (Human-in-the-loop)                                      │
+│     Resolve contradictions → ReviewDecision → DecisionLock          │
+│     Confirm/reject alias mappings                                   │
+│     Supersede previous decisions if needed                          │
+│     Agent respects all locks — cannot reopen resolved issues        │
+│                                                                     │
+│  6. OPTIMIZE (Increments 9, 11 — in progress)                      │
+│     Promote staging rows → LedgerLabourHour (UNSORTED bucket)       │
+│     Partial inclusion fractions (0.0–1.0)                           │
+│     Scenario totals: Conservative / Balanced / Aggressive           │
+│     Group hours into Claim Projects                                 │
+│                                                                     │
+│  7. EXPORT (Increment 12 — planned)                                 │
+│     Narrative drafting with evidence-bounded citations               │
+│     Export bundle: JSON + Markdown + CSV + citation index            │
+│     Hard-blocked if evidence gaps or BLOCKING contradictions remain  │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Architecture at a Glance
+
+| Layer | Components | Purpose |
+|---|---|---|
+| **UI** | Streamlit multipage app (8 pages) | Run management, people intake, file upload, search, CSV tools, agent runner, tasks & gates, payroll validation |
+| **Agent** | OpenAI tool-calling loop + 18 registered tools | Autonomous multi-step reasoning with full observability (every LLM call and tool invocation logged to DB) |
+| **Tools** | Ingest, search, CSV intelligence, people, aliases, payroll, tasks, contradictions, locks, memory | Safe operations layer — the agent never writes raw SQL or modifies the DB directly |
+| **Models** | 17 SQLModel tables + 2 FTS5 virtual tables | Canonical data, staging, world model, observability, search indices |
+| **Search** | FTS5 (BM25) + OpenAI embeddings + hybrid RRF fusion | Cross-file coherence without giant context windows |
+| **LLM** | OpenAI API (4 model roles) | Vision OCR, embeddings, agent reasoning, structured JSON extraction |
+| **Storage** | SQLite + local filesystem | Everything persisted locally — data never leaves the machine except for OpenAI API calls |
+
+### Key Design Principles
+
+- **People-first anchors** — People records are the foundation; rates must be set before export
+- **Conservative branching** — Competing hypotheses only when ambiguity is material
+- **Human decisions are final** — DecisionLocks prevent the agent from reopening resolved issues
+- **Idempotency everywhere** — File dedup by SHA256, staging dedup by row hash, task dedup by issue_key, embedding dedup by entity key
+- **Observability built-in** — Every LLM call and tool invocation logged with tokens, duration, args, and results
+- **Hard gates before export** — Blocking contradictions and evidence gaps must be resolved before any output is generated
+- **Local-first** — All data persisted in SQLite + filesystem; external calls only to OpenAI API
 
 ---
 
@@ -62,19 +149,20 @@ SRED_v5/
 │   │   ├── __init__.py           # Re-exports all models
 │   │   ├── base.py               # TimestampMixin, ProvenanceMixin
 │   │   ├── core.py               # Run, Person, File, Segment (+ enums)
-│   │   ├── finance.py            # StagingRow, LedgerLabourHour
+│   │   ├── finance.py            # StagingRow, LedgerLabourHour, PayrollExtract
 │   │   ├── hypothesis.py         # Hypothesis, StagingMappingProposal
 │   │   ├── artifact.py           # ExtractionArtifact
 │   │   ├── vector.py             # VectorEmbedding (BLOB storage)
 │   │   ├── memory.py             # MemoryDoc (markdown memory)
 │   │   ├── world.py              # Contradiction, ReviewTask, ReviewDecision, DecisionLock
+│   │   ├── alias.py              # PersonAlias (identity resolution mappings)
 │   │   └── agent_log.py          # ToolCallLog, LLMCallLog
 │   │
 │   ├── agent/
 │   │   ├── __init__.py
 │   │   ├── registry.py           # Tool registry (register_tool, get_openai_tools_schema)
 │   │   ├── runner.py             # OpenAI tool-calling loop (run_agent_loop)
-│   │   └── tools.py              # 12 registered tool implementations
+│   │   └── tools.py              # 18 registered tool implementations
 │   │
 │   ├── ingest/
 │   │   ├── csv_intel.py          # DuckDB: csv_profile, csv_query, propose_schema_mapping
@@ -106,10 +194,11 @@ SRED_v5/
 │           ├── 5_search.py       # Hybrid/FTS/Vector search UI
 │           ├── 6_csv_tools.py    # CSV profiling, SQL console, schema hypotheses
 │           ├── 7_agent.py        # Agent runner UI (run loop, trace, logs)
-│           └── 8_tasks.py        # Tasks & Gates (contradictions, resolve, locks, supersede)
+│           ├── 8_tasks.py        # Tasks & Gates (contradictions, resolve, locks, supersede)
+│           └── 9_payroll.py      # Payroll validation (extracts, mismatch breakdown, contradictions)
 │
 └── tests/
-    ├── test_agent.py             # 28 tests: tools, registry, gates, locks, agent loop
+    ├── test_agent.py             # 64 tests: tools, registry, gates, locks, agent loop, aliases, payroll, context
     ├── test_csv_intel.py         # 3 tests: DuckDB profile, query, schema proposal
     ├── test_db.py                # 4 tests: core/finance/artifact/vector models
     ├── test_ingest.py            # 3 tests: chunking, text processing, PDF processing
@@ -159,6 +248,7 @@ All settings are in `src/sred/config.py` via `pydantic-settings`. Loaded from `.
 |---|---|---|
 | **StagingRow** | `run_id`, `raw_data` (JSON), `status`, `row_type`, `row_hash`, `normalized_text` | Row types: `UNKNOWN`, `TIMESHEET`, `PAYROLL`, `INVOICE`, `JIRA`. Inherits ProvenanceMixin. |
 | **LedgerLabourHour** | `run_id`, `person_id`, `date`, `hours`, `description`, `bucket`, `inclusion_fraction`, `confidence` | Bucket defaults to `UNSORTED`. **Not yet populated by any tool** — this is Increment 9. |
+| **PayrollExtract** | `run_id`, `file_id`, `period_start`, `period_end`, `total_hours`, `total_wages`, `currency`, `employee_count`, `confidence`, `raw_json` | Structured payroll data extracted via LLM from vision artifacts. Unique constraint on `(run_id, file_id, period_start, period_end)`. |
 
 ### 4.4 Hypothesis (`models/hypothesis.py`)
 
@@ -176,7 +266,13 @@ All settings are in `src/sred/config.py` via `pydantic-settings`. Loaded from `.
 | **ReviewDecision** | `run_id`, `task_id`, `decision`, `decided_by` | Free-text human resolution. `decided_by`: `HUMAN` or `SYSTEM`. |
 | **DecisionLock** | `run_id`, `issue_key`, `decision_id`, `reason`, `active` | Prevents re-opening resolved issues. `active=False` when superseded. |
 
-### 4.6 Other Models
+### 4.6 Identity Resolution (`models/alias.py`) — Increment 9a
+
+| Model | Key Fields | Notes |
+|---|---|---|
+| **PersonAlias** | `run_id`, `person_id`, `alias`, `source`, `confidence`, `status` | Maps raw name variants to canonical Person records. Status: `PROPOSED`/`CONFIRMED`/`REJECTED`. Unique constraint on `(run_id, alias)`. |
+
+### 4.7 Other Models
 
 | Model | File | Notes |
 |---|---|---|
@@ -216,10 +312,16 @@ All handlers have signature: `handler(session: Session, run_id: int, **kwargs) -
 | `contradictions_create` | Create Contradiction | **Deduped by issue_key, blocked by DecisionLock** |
 | `locks_list_active` | List active DecisionLocks | — |
 | `memory_write_summary` | Write/update MemoryDoc | Idempotent by path + content_hash |
+| `aliases_resolve` | Fuzzy-match raw names to Person | Extracts distinct names from TIMESHEET StagingRows, proposes matches. **Read-only.** |
+| `aliases_confirm` | Persist alias→Person mapping | Idempotent (updates if alias exists). Validates person belongs to run. |
+| `aliases_list` | List all PersonAlias records | — |
+| `payroll_extract` | LLM-extract payroll periods from vision artifacts | Structured JSON extraction via `OPENAI_MODEL_STRUCTURED`. Idempotent per period. |
+| `payroll_validate` | Compare payroll vs timesheet totals | >5% mismatch → BLOCKING Contradiction + ReviewTask + gate update. Deduped. |
+| `payroll_summary` | List PayrollExtract records | — |
 
 ### 5.3 Agent Runner (`agent/runner.py`)
 
-`run_agent_loop(session, run_id, user_message, max_steps=10) -> AgentResult`
+`run_agent_loop(session, run_id, user_message, max_steps=10, context_notes=None) -> AgentResult`
 
 - Uses `OPENAI_MODEL_AGENT` with OpenAI tool-calling
 - Multi-step loop: LLM → tool calls → feed results back → repeat
@@ -227,13 +329,15 @@ All handlers have signature: `handler(session: Session, run_id: int, **kwargs) -
 - Logs every LLM call to `LLMCallLog` and every tool call to `ToolCallLog`
 - Returns `AgentResult` with full step trace
 
-### 5.4 System Prompt
+### 5.4 Dynamic System Prompt
 
-The agent is instructed to:
-- Never write raw SQL or modify DB directly
-- Use provided tools only
-- Create tasks/contradictions for uncertain situations rather than guessing
-- Respect DecisionLocks
+The system prompt is assembled dynamically from three parts:
+
+1. **Static rules** — capabilities list, behavioral rules (never write raw SQL, use tools only, etc.)
+2. **`## Current Run State`** — auto-generated by `build_run_context(session, run_id)` on every invocation. Includes: run name/status, people count (+ pending rates), files uploaded/processed, timesheet staging row count, alias counts (confirmed/total), open contradictions/tasks, active decision locks.
+3. **`## Immediate Goal`** — optional `context_notes` string passed by the caller (e.g., "We are currently resolving identities for File #12"). Only included when provided.
+
+This ensures the agent always knows its immediate situation without the caller needing to manually describe the run state.
 
 ---
 
@@ -308,8 +412,9 @@ Navigation defined in `streamlit_app.py`. All pages use `Session(engine)` direct
 | Dashboard | `4_dashboard.py` | Metrics (people count, file count, pending rates). Readiness checklist. |
 | Search | `5_search.py` | Hybrid/FTS/Vector search with mode selector. |
 | CSV Tools | `6_csv_tools.py` | Profile, SQL console, schema hypothesis generation. |
-| Agent Runner | `7_agent.py` | Run agent loop with max_steps slider. Full step trace. Tool + LLM call history. |
+| Agent Runner | `7_agent.py` | Run agent loop with max_steps slider + optional context notes. Full step trace. Tool + LLM call history. |
 | Tasks & Gates | `8_tasks.py` | Contradictions list, review tasks with resolve→lock flow, supersede lock UI. Gate status banner. |
+| Payroll Validation | `9_payroll.py` | Payroll extracts list, per-period mismatch breakdown table (🔴/🟢), overall summary metrics, payroll contradiction list. |
 
 ---
 
@@ -352,11 +457,11 @@ pytest>=8.0.0
 
 ## 12. Test Suite
 
-Run: `uv run pytest` (48 tests, ~2s)
+Run: `uv run pytest` (84 tests, ~2s)
 
 | File | Tests | Coverage |
 |---|---|---|
-| `test_agent.py` | 28 | Tool registry, all tool functions, issue_key dedup, lock enforcement, gate logic (6 gate tests), agent loop (simple, tool call, max steps, unknown tool) |
+| `test_agent.py` | 64 | Tool registry (18 tools), all tool functions, issue_key dedup, lock enforcement, gate logic (6 gate tests), agent loop (simple, tool call, max steps, unknown tool), fuzzy ratio (4), alias tools (resolve/confirm/list — 9), build_run_context (3), dynamic prompt injection (2), payroll tools (extract/validate/summary — 12) |
 | `test_csv_intel.py` | 3 | DuckDB profile, query, schema proposal (mocked LLM) |
 | `test_db.py` | 4 | Core models, finance models, artifacts, vector embeddings (unique constraint) |
 | `test_ingest.py` | 3 | Text chunking, text file processing, PDF processing (mocked vision) |
@@ -399,10 +504,12 @@ Both `Contradiction` and `ReviewTask` use an `issue_key` string (e.g. `MISSING_R
 - Embeddings: skips if `(entity_type, entity_id, model)` exists
 - Memory docs: skips if `content_hash` unchanged
 - Tasks/contradictions: deduped by `issue_key`
+- Person aliases: unique constraint on `(run_id, alias)` — confirm updates existing record
+- Payroll extracts: unique constraint on `(run_id, file_id, period_start, period_end)` — skips existing periods
 
 ---
 
-## 14. What's Built (Increments 1–8)
+## 14. What's Built (Increments 1–10)
 
 | # | Increment | Status |
 |---|---|---|
@@ -414,27 +521,22 @@ Both `Contradiction` and `ReviewTask` use an `issue_key` string (e.g. `MISSING_R
 | 6 | CSV intelligence (DuckDB profiling + schema mapping hypotheses) | Done |
 | 7 | Agent runner (OpenAI tool-calling loop) + tool registry + logs | Done |
 | 8 | World model (contradictions, review tasks, decision locks, gates) | Done |
+| 9a | Identity resolution (PersonAlias model, fuzzy matching, alias tools) | Done |
+| 9b | Dynamic agent context injection (build_run_context, context_notes) | Done |
+| 10 | Payroll extraction (structured LLM extraction) + mismatch validation (>5% → BLOCKING) + UI | Done |
 
 ---
 
-## 15. What's Next (Increments 9–12)
+## 15. What's Next (Increments 9c, 11–12)
 
-### Increment 9: Labour Hours Ledger + Scenarios
+### Increment 9c: Labour Hours Ledger + Scenarios (remaining work)
 - Promote timesheet-like `StagingRow`s into `LedgerLabourHour` (bucket=`UNSORTED`)
 - Partial inclusion support (`inclusion_fraction`)
 - Scenario computation: Conservative (conf≥0.8), Balanced (conf≥0.5), Aggressive (conf≥0.2)
 - Missing rate → BLOCKING contradiction before export
 - Statuses: `DRAFT`, `UNSUBSTANTIATED`, `READY`
 
-**Key models already exist:** `LedgerLabourHour` in `models/finance.py`, `Person.rate_status` in `models/core.py`
-
-### Increment 10: Payroll Extraction + Mismatch Validation
-- Vision-extract payroll text → structured output (period totals)
-- Compare payroll totals vs timesheet totals
-- Mismatch > 5% (`PAYROLL_MISMATCH_THRESHOLD`) → BLOCKING contradiction + ReviewTask
-- Use `OPENAI_MODEL_STRUCTURED` for strict JSON extraction
-
-**Key infrastructure already exists:** `ContradictionType.PAYROLL_MISMATCH`, `PAYROLL_MISMATCH_THRESHOLD` in config
+**Key models already exist:** `LedgerLabourHour` in `models/finance.py`, `Person.rate_status` in `models/core.py`. Identity resolution (PersonAlias) is now complete, enabling person mapping for promotion.
 
 ### Increment 11: Review & Grouping
 - Create `ClaimProject` model (not yet created)
@@ -468,7 +570,7 @@ Both `Contradiction` and `ReviewTask` use an `issue_key` string (e.g. `MISSING_R
 
 7. **CSV `process_csv_content`** — Uses `pd.json_normalize` in a hacky way (line 75 of `segment.py`), then immediately overwrites with `json.dumps`. The normalize call is dead code.
 
-8. **No identity resolution yet** — The project spec (section 9) calls for alias mapping (invoice names → Person, Jira usernames → Person). Not yet implemented.
+8. **~~No identity resolution yet~~** — **Resolved in Increment 9a.** PersonAlias model + `aliases_resolve`/`aliases_confirm`/`aliases_list` tools now handle fuzzy name→Person mapping. Future work: extend to invoice vendor names, Jira usernames, and email extraction (see §16C below).
 
 ---
 

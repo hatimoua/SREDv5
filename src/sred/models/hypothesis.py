@@ -15,6 +15,7 @@ class HypothesisStatus(str, Enum):
     ACCEPTED = "ACCEPTED"
 
 class Hypothesis(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     run_id: int = Field(foreign_key="run.id", index=True)
     
@@ -29,6 +30,7 @@ class Hypothesis(TimestampMixin, table=True):
 
 
 class StagingMappingProposal(TimestampMixin, table=True):
+    __table_args__ = {"extend_existing": True}
     id: Optional[int] = Field(default=None, primary_key=True)
     
     hypothesis_id: int = Field(foreign_key="hypothesis.id")

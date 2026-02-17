@@ -44,7 +44,7 @@ def get_vision_completion(image_path: str, prompt: str, system_prompt: str = "Yo
                     ],
                 }
             ],
-            max_tokens=4096, # Reasonable limit for page extraction
+            max_completion_tokens=4096, # Reasonable limit for page extraction
         )
         return response.choices[0].message.content
     except Exception as e:
