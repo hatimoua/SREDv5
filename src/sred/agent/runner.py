@@ -14,7 +14,7 @@ from sred.config import settings
 from sred.llm.openai_client import client
 from sred.models.agent_log import ToolCallLog, LLMCallLog
 from sred.models.core import Run, Person, File, RateStatus, FileStatus
-from sred.models.finance import StagingRow, StagingRowType
+from sred.models.finance import StagingRow, StagingRowType, StagingStatus, LedgerLabourHour
 from sred.models.alias import PersonAlias, AliasStatus
 from sred.models.world import Contradiction, ContradictionStatus, ReviewTask, ReviewTaskStatus, DecisionLock
 from sred.agent.registry import get_openai_tools_schema, get_tool_handler
@@ -33,10 +33,18 @@ You have access to tools for:
 - Profiling and querying CSV data via DuckDB
 - Managing people (employees/contractors)
 - Resolving person-name aliases (entity resolution)
+- Populating the labour ledger from confirmed aliases and staging rows
+- Extracting and validating payroll data
 - Creating and listing tasks (hypotheses)
 - Flagging contradictions for human review
 - Checking locked decisions
 - Writing memory/summary documents
+
+Workflow for ledger population:
+1. Use aliases_resolve to find name variants in staging rows.
+2. Use aliases_confirm to link each alias to a Person.
+3. Use ledger_populate to map confirmed aliases to staging rows and create LedgerLabourHour entries.
+   ledger_populate auto-detects column names (Employee, Total Working Hours, etc.) and is idempotent.
 
 Rules:
 - Never write raw SQL or modify the database directly. Always use the provided tools.
@@ -112,6 +120,30 @@ def build_run_context(session: Session, run_id: int) -> str:
         )
     ).one()
     lines.append(f"Active decision locks: {active_locks}")
+
+    # Staging rows (all types)
+    staging_total = session.exec(
+        select(func.count(StagingRow.id)).where(StagingRow.run_id == run_id)
+    ).one()
+    staging_pending = session.exec(
+        select(func.count(StagingRow.id)).where(
+            StagingRow.run_id == run_id,
+            StagingRow.status == StagingStatus.PENDING,
+        )
+    ).one()
+    staging_promoted = session.exec(
+        select(func.count(StagingRow.id)).where(
+            StagingRow.run_id == run_id,
+            StagingRow.status == StagingStatus.PROMOTED,
+        )
+    ).one()
+    lines.append(f"Staging rows: {staging_total} total, {staging_pending} pending, {staging_promoted} promoted")
+
+    # Ledger
+    ledger_count = session.exec(
+        select(func.count(LedgerLabourHour.id)).where(LedgerLabourHour.run_id == run_id)
+    ).one()
+    lines.append(f"Ledger labour-hour entries: {ledger_count}")
 
     return "\n".join(lines)
 
