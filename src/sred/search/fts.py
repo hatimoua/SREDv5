@@ -65,6 +65,40 @@ def reindex_all():
         session.commit()
     logger.info("Reindexing complete.")
 
+def index_segments(segment_ids: list[int]):
+    """Incrementally insert specific segments into the FTS index.
+
+    Safe to call even if the segment is already indexed (uses INSERT OR IGNORE
+    semantics via a NOT EXISTS guard).
+    """
+    if not segment_ids:
+        return
+    setup_fts()  # ensure virtual table exists
+    with Session(engine) as session:
+        for sid in segment_ids:
+            session.exec(text("""
+                INSERT INTO segment_fts(rowid, id, content)
+                SELECT id, id, content FROM segment
+                WHERE id = :sid
+                AND id NOT IN (SELECT rowid FROM segment_fts)
+            """), params={"sid": sid})
+        session.commit()
+    logger.info(f"Indexed {len(segment_ids)} segment(s) into FTS.")
+
+
+def index_memory(memory_id: int):
+    """Incrementally insert a single MemoryDoc into the FTS index."""
+    setup_fts()
+    with Session(engine) as session:
+        session.exec(text("""
+            INSERT INTO memory_fts(rowid, id, content_md)
+            SELECT id, id, content_md FROM memorydoc
+            WHERE id = :mid
+            AND id NOT IN (SELECT rowid FROM memory_fts)
+        """), params={"mid": memory_id})
+        session.commit()
+
+
 def search_segments(query: str, limit: int = 10):
     with Session(engine) as session:
         results = session.exec(text(f"""

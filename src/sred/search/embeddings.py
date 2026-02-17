@@ -7,7 +7,7 @@ from sred.config import settings
 from sred.models.vector import VectorEmbedding, EntityType
 from sred.logging import logger
 
-EMBEDDING_MODEL = "text-embedding-3-small"
+EMBEDDING_MODEL = settings.OPENAI_EMBEDDING_MODEL
 
 def compute_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()

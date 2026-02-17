@@ -8,6 +8,7 @@ from sred.models.artifact import ExtractionArtifact, ArtifactKind
 from sred.models.finance import StagingRow, StagingStatus
 from sred.ingest.vision import vision_extract_pdf, vision_extract_image
 from sred.ingest.segment import create_text_segments, process_csv_content, chunk_text
+from sred.search.fts import index_segments
 from sred.logging import logger
 import docx
 
@@ -61,6 +62,7 @@ def process_source_file(file_id: int):
                 # A bit complex because artifacts might be page-based.
                 # If we have cached artifacts, we should use their data.
                 
+                all_segs = []
                 for art in cached_texts:
                     # art.data contains the text
                     # We can create segments from it.
@@ -69,11 +71,12 @@ def process_source_file(file_id: int):
                     # If it's VISION_TEXT, it's just the text.
                     # We might have stored page info in segment_ids? No, segment_ids is backlink.
                     # ProvenanceMixin has page_number.
-                    create_text_segments(session, file, art.data, page_number=art.page_number)
+                    all_segs.extend(create_text_segments(session, file, art.data, page_number=art.page_number))
                 
                 file.status = FileStatus.PROCESSED
                 session.add(file)
                 session.commit()
+                index_segments([s.id for s in all_segs if s.id])
                 return
 
             # 2. Process based on type
@@ -163,6 +166,13 @@ def process_source_file(file_id: int):
             file.status = FileStatus.PROCESSED
             session.add(file)
             session.commit()
+
+            # Incrementally index all new segments into FTS
+            new_seg_ids = [s.id for s in session.exec(
+                select(Segment).where(Segment.file_id == file.id)
+            ).all() if s.id]
+            index_segments(new_seg_ids)
+
             logger.info(f"Successfully processed {file.original_filename}")
             
         except Exception as e:
