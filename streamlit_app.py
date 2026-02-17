@@ -35,6 +35,7 @@ pg = st.navigation([
     st.Page("src/sred/ui/pages/8_tasks.py", title="Tasks & Gates", icon="🚦"),
     st.Page("src/sred/ui/pages/9_payroll.py", title="Payroll Validation", icon="💰"),
     st.Page("src/sred/ui/pages/10_trace.py", title="Execution Trace", icon="🔍"),
+    st.Page("src/sred/ui/pages/11_ledger.py", title="Labour Ledger", icon="📒"),
 ])
 
 pg.run()

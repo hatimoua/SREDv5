@@ -14,7 +14,7 @@ from typing import Dict, Any, List
 from datetime import date as date_type
 from sqlmodel import Session, select, func
 from sred.models.core import File, Segment, Person, Run, RateStatus
-from sred.models.finance import StagingRow, StagingRowType, PayrollExtract
+from sred.models.finance import StagingRow, StagingRowType, StagingStatus, LedgerLabourHour, PayrollExtract
 from sred.models.artifact import ExtractionArtifact, ArtifactKind
 from sred.models.memory import MemoryDoc
 from sred.models.alias import PersonAlias, AliasStatus
@@ -1119,4 +1119,242 @@ register_tool(
     description="List all extracted payroll period records for the current run.",
     parameters={"type": "object", "properties": {}, "required": []},
     handler=_payroll_summary,
+)
+
+
+# ---------------------------------------------------------------------------
+# ledger.populate — Map staging rows to Person via confirmed aliases
+# ---------------------------------------------------------------------------
+# Configurable column names the tool will try when extracting fields from
+# StagingRow.raw_data.  The first match wins (case-insensitive).
+_NAME_COLS = ["Employee", "employee", "Name", "name", "Full Name", "full_name"]
+_HOURS_COLS = [
+    "Total Working Hours", "total_working_hours", "Hours", "hours",
+    "Total Hrs", "total_hrs", "Hrs",
+]
+_SRED_HOURS_COLS = [
+    "Attributed SR&ED/R&D Hours", "attributed_sred_hours", "SR&ED Hours",
+    "sred_hours", "SRED Hours", "Claimed Hours",
+]
+_DATE_START_COLS = ["Salary Start Date", "start_date", "Start Date", "date"]
+_DATE_END_COLS = ["Salary End Date", "end_date", "End Date"]
+_DESCRIPTION_COLS = ["Description", "description", "Task", "task", "Role", "role"]
+
+
+def _first_match(d: dict, candidates: list[str]):
+    """Return the value for the first key in *candidates* found in *d*."""
+    for c in candidates:
+        if c in d:
+            return d[c]
+    return None
+
+
+def _ledger_populate(
+    session: Session,
+    run_id: int,
+    *,
+    name_column: str | None = None,
+    hours_column: str | None = None,
+    sred_hours_column: str | None = None,
+    date_start_column: str | None = None,
+    date_end_column: str | None = None,
+    description_column: str | None = None,
+) -> dict:
+    """Map StagingRow timesheet data to canonical Person records using
+    confirmed PersonAlias entries and populate LedgerLabourHour.
+
+    For each PENDING StagingRow that contains a name matching a CONFIRMED
+    alias, a LedgerLabourHour record is created with:
+      - person_id from the alias
+      - hours from the staging row
+      - inclusion_fraction = SR&ED hours / total hours (if available)
+      - confidence = alias confidence score
+      - bucket = "SR&ED" if SR&ED hours present, else "UNSORTED"
+
+    The StagingRow is then promoted to PROMOTED status and its row_type
+    set to TIMESHEET.
+
+    Idempotent: skips staging rows that are already PROMOTED.
+    """
+
+    # 1. Load confirmed aliases → build name→person_id lookup (case-insensitive)
+    aliases = session.exec(
+        select(PersonAlias).where(
+            PersonAlias.run_id == run_id,
+            PersonAlias.status == AliasStatus.CONFIRMED,
+        )
+    ).all()
+
+    if not aliases:
+        return {"error": "No CONFIRMED PersonAlias records found. Run aliases_resolve / aliases_confirm first."}
+
+    # Map lowercased alias → (person_id, confidence)
+    alias_map: Dict[str, tuple[int, float]] = {}
+    for a in aliases:
+        alias_map[a.alias.strip().lower()] = (a.person_id, a.confidence)
+
+    # 2. Load pending staging rows
+    staging_rows = session.exec(
+        select(StagingRow).where(
+            StagingRow.run_id == run_id,
+            StagingRow.status == StagingStatus.PENDING,
+        )
+    ).all()
+
+    if not staging_rows:
+        return {"error": "No PENDING StagingRows found."}
+
+    # Override column names if caller specified them
+    name_cols = [name_column] if name_column else _NAME_COLS
+    hours_cols = [hours_column] if hours_column else _HOURS_COLS
+    sred_cols = [sred_hours_column] if sred_hours_column else _SRED_HOURS_COLS
+    start_cols = [date_start_column] if date_start_column else _DATE_START_COLS
+    end_cols = [date_end_column] if date_end_column else _DATE_END_COLS
+    desc_cols = [description_column] if description_column else _DESCRIPTION_COLS
+
+    created = 0
+    skipped = 0
+    unmatched: List[str] = []
+    errors: List[str] = []
+
+    for sr in staging_rows:
+        try:
+            row = json.loads(sr.raw_data)
+        except json.JSONDecodeError:
+            errors.append(f"staging_row {sr.id}: invalid JSON")
+            continue
+
+        # Extract employee name
+        raw_name = _first_match(row, name_cols)
+        if not raw_name or not str(raw_name).strip():
+            errors.append(f"staging_row {sr.id}: no name column found")
+            continue
+
+        name_key = str(raw_name).strip().lower()
+
+        # Look up alias
+        match = alias_map.get(name_key)
+        if not match:
+            unmatched.append(str(raw_name).strip())
+            skipped += 1
+            continue
+
+        person_id, alias_confidence = match
+
+        # Extract hours
+        total_hours_raw = _first_match(row, hours_cols)
+        if total_hours_raw is None:
+            errors.append(f"staging_row {sr.id}: no hours column found")
+            continue
+        try:
+            total_hours = float(total_hours_raw)
+        except (ValueError, TypeError):
+            errors.append(f"staging_row {sr.id}: non-numeric hours '{total_hours_raw}'")
+            continue
+
+        # Extract SR&ED hours (optional)
+        sred_hours_raw = _first_match(row, sred_cols)
+        sred_hours: float | None = None
+        if sred_hours_raw is not None:
+            try:
+                sred_hours = float(sred_hours_raw)
+            except (ValueError, TypeError):
+                pass
+
+        # Compute inclusion_fraction
+        if sred_hours is not None and total_hours > 0:
+            inclusion_fraction = round(sred_hours / total_hours, 4)
+        else:
+            inclusion_fraction = 1.0
+
+        # Determine bucket
+        bucket = "SR&ED" if sred_hours is not None else "UNSORTED"
+
+        # Extract date range
+        start_raw = _first_match(row, start_cols)
+        end_raw = _first_match(row, end_cols)
+        try:
+            start_date = date_type.fromisoformat(str(start_raw)) if start_raw else date_type.today()
+        except ValueError:
+            start_date = date_type.today()
+        try:
+            end_date = date_type.fromisoformat(str(end_raw)) if end_raw else start_date
+        except ValueError:
+            end_date = start_date
+
+        # Extract description (optional)
+        desc = _first_match(row, desc_cols)
+        description = str(desc).strip() if desc else None
+
+        # Create LedgerLabourHour — use start_date as the canonical date
+        llh = LedgerLabourHour(
+            run_id=run_id,
+            person_id=person_id,
+            date=start_date,
+            hours=total_hours,
+            description=description,
+            bucket=bucket,
+            inclusion_fraction=inclusion_fraction,
+            confidence=alias_confidence,
+        )
+        session.add(llh)
+
+        # Promote the staging row
+        sr.status = StagingStatus.PROMOTED
+        sr.row_type = StagingRowType.TIMESHEET
+        session.add(sr)
+
+        created += 1
+
+    session.commit()
+
+    return {
+        "created": created,
+        "skipped": skipped,
+        "unmatched_names": sorted(set(unmatched)),
+        "errors": errors,
+        "total_staging_rows": len(staging_rows),
+    }
+
+
+register_tool(
+    name="ledger_populate",
+    description=(
+        "Map PENDING StagingRow timesheet data to canonical Person records using "
+        "CONFIRMED PersonAlias entries. Creates LedgerLabourHour records with "
+        "person_id, hours, inclusion_fraction (SR&ED hrs / total hrs), and "
+        "confidence from the alias match. Promotes matched staging rows to PROMOTED. "
+        "Idempotent: only processes PENDING rows."
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "name_column": {
+                "type": "string",
+                "description": "Column name in raw_data for employee name. Auto-detected if omitted.",
+            },
+            "hours_column": {
+                "type": "string",
+                "description": "Column name in raw_data for total hours. Auto-detected if omitted.",
+            },
+            "sred_hours_column": {
+                "type": "string",
+                "description": "Column name in raw_data for SR&ED hours. Auto-detected if omitted.",
+            },
+            "date_start_column": {
+                "type": "string",
+                "description": "Column name in raw_data for period start date. Auto-detected if omitted.",
+            },
+            "date_end_column": {
+                "type": "string",
+                "description": "Column name in raw_data for period end date. Auto-detected if omitted.",
+            },
+            "description_column": {
+                "type": "string",
+                "description": "Column name in raw_data for work description. Auto-detected if omitted.",
+            },
+        },
+        "required": [],
+    },
+    handler=_ledger_populate,
 )

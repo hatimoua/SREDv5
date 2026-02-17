@@ -17,7 +17,7 @@ from sred.gates import (
 )
 from sred.agent.registry import get_openai_tools_schema, get_tool_handler, TOOL_REGISTRY
 from sred.models.alias import PersonAlias, AliasStatus
-from sred.models.finance import StagingRow, StagingRowType, PayrollExtract
+from sred.models.finance import StagingRow, StagingRowType, StagingStatus, LedgerLabourHour, PayrollExtract
 from sred.models.artifact import ExtractionArtifact, ArtifactKind
 from sred.models.core import FileStatus
 from datetime import date
@@ -37,6 +37,7 @@ from sred.agent.tools import (
     _payroll_extract,
     _payroll_validate,
     _payroll_summary,
+    _ledger_populate,
 )
 
 
@@ -1263,3 +1264,193 @@ def test_payroll_summary_with_data(session, run):
     assert result["count"] == 1
     assert result["extracts"][0]["total_hours"] == 320.0
     assert result["extracts"][0]["period_start"] == "2025-01-01"
+
+
+# ---------------------------------------------------------------------------
+# ledger_populate tests
+# ---------------------------------------------------------------------------
+def _make_person(session, run, name, role="Engineer"):
+    p = Person(run_id=run.id, name=name, role=role)
+    session.add(p)
+    session.commit()
+    session.refresh(p)
+    return p
+
+
+def _make_confirmed_alias(session, run, person, alias_text, confidence=0.95):
+    pa = PersonAlias(
+        run_id=run.id,
+        person_id=person.id,
+        alias=alias_text,
+        confidence=confidence,
+        status=AliasStatus.CONFIRMED,
+    )
+    session.add(pa)
+    session.commit()
+    return pa
+
+
+def _make_timesheet_staging_row(session, run, employee, total_hours=160.0, sred_hours=140.0):
+    raw = {
+        "Employee": employee,
+        "Salary Start Date": "2024-01-01",
+        "Salary End Date": "2024-12-31",
+        "Salary Hours Per Day": 8,
+        "Total Working Hours": total_hours,
+        "Attributed SR&ED/R&D Hours": sred_hours,
+        "Claimable Percent (Before ASA)": round(sred_hours / total_hours * 100, 1) if total_hours else 0,
+    }
+    raw_json = json.dumps(raw)
+    sr = StagingRow(
+        run_id=run.id,
+        raw_data=raw_json,
+        row_hash=hashlib.sha256(raw_json.encode()).hexdigest(),
+        normalized_text=f"{employee} {total_hours}h",
+        status=StagingStatus.PENDING,
+        row_type=StagingRowType.UNKNOWN,
+    )
+    session.add(sr)
+    session.commit()
+    session.refresh(sr)
+    return sr
+
+
+def test_ledger_populate_no_aliases(session, run):
+    """Should fail if no confirmed aliases exist."""
+    _make_timesheet_staging_row(session, run, "Alice")
+    result = _ledger_populate(session, run.id)
+    assert "error" in result
+    assert "CONFIRMED" in result["error"]
+
+
+def test_ledger_populate_no_staging_rows(session, run):
+    """Should fail if no pending staging rows exist."""
+    p = _make_person(session, run, "Alice")
+    _make_confirmed_alias(session, run, p, "Alice")
+    result = _ledger_populate(session, run.id)
+    assert "error" in result
+    assert "PENDING" in result["error"]
+
+
+def test_ledger_populate_basic(session, run):
+    """Happy path: one alias, one staging row → one LedgerLabourHour."""
+    p = _make_person(session, run, "Alice Smith")
+    _make_confirmed_alias(session, run, p, "Alice Smith", confidence=0.92)
+    _make_timesheet_staging_row(session, run, "Alice Smith", total_hours=2016.0, sred_hours=1854.72)
+
+    result = _ledger_populate(session, run.id)
+    assert result["created"] == 1
+    assert result["skipped"] == 0
+    assert result["unmatched_names"] == []
+    assert result["errors"] == []
+
+    # Verify LedgerLabourHour was created
+    ledger = session.exec(select(LedgerLabourHour).where(LedgerLabourHour.run_id == run.id)).all()
+    assert len(ledger) == 1
+    assert ledger[0].person_id == p.id
+    assert ledger[0].hours == 2016.0
+    assert ledger[0].bucket == "SR&ED"
+    assert abs(ledger[0].inclusion_fraction - (1854.72 / 2016.0)) < 0.001
+    assert ledger[0].confidence == 0.92
+    assert ledger[0].date == date(2024, 1, 1)
+
+    # Verify staging row was promoted
+    sr = session.exec(select(StagingRow).where(StagingRow.run_id == run.id)).first()
+    assert sr.status == StagingStatus.PROMOTED
+    assert sr.row_type == StagingRowType.TIMESHEET
+
+
+def test_ledger_populate_unmatched_names(session, run):
+    """Staging rows with names not in alias map should be skipped."""
+    p = _make_person(session, run, "Alice")
+    _make_confirmed_alias(session, run, p, "Alice")
+    _make_timesheet_staging_row(session, run, "Alice", total_hours=100.0, sred_hours=80.0)
+    _make_timesheet_staging_row(session, run, "Bob Unknown", total_hours=200.0, sred_hours=200.0)
+
+    result = _ledger_populate(session, run.id)
+    assert result["created"] == 1
+    assert result["skipped"] == 1
+    assert "Bob Unknown" in result["unmatched_names"]
+
+    ledger = session.exec(select(LedgerLabourHour).where(LedgerLabourHour.run_id == run.id)).all()
+    assert len(ledger) == 1
+
+
+def test_ledger_populate_multiple_employees(session, run):
+    """Multiple employees with confirmed aliases all get ledger entries."""
+    p1 = _make_person(session, run, "Alice")
+    p2 = _make_person(session, run, "Bob")
+    _make_confirmed_alias(session, run, p1, "Alice", confidence=1.0)
+    _make_confirmed_alias(session, run, p2, "Bob", confidence=0.85)
+    _make_timesheet_staging_row(session, run, "Alice", total_hours=2016.0, sred_hours=1854.72)
+    _make_timesheet_staging_row(session, run, "Bob", total_hours=328.0, sred_hours=328.0)
+
+    result = _ledger_populate(session, run.id)
+    assert result["created"] == 2
+    assert result["skipped"] == 0
+
+    ledger = session.exec(
+        select(LedgerLabourHour).where(LedgerLabourHour.run_id == run.id)
+    ).all()
+    assert len(ledger) == 2
+    hours_by_person = {l.person_id: l.hours for l in ledger}
+    assert hours_by_person[p1.id] == 2016.0
+    assert hours_by_person[p2.id] == 328.0
+
+
+def test_ledger_populate_idempotent(session, run):
+    """Running twice should not create duplicates — promoted rows are skipped."""
+    p = _make_person(session, run, "Alice")
+    _make_confirmed_alias(session, run, p, "Alice")
+    _make_timesheet_staging_row(session, run, "Alice", total_hours=100.0, sred_hours=90.0)
+
+    result1 = _ledger_populate(session, run.id)
+    assert result1["created"] == 1
+
+    result2 = _ledger_populate(session, run.id)
+    assert "error" in result2  # No PENDING rows left
+    assert "PENDING" in result2["error"]
+
+    ledger = session.exec(select(LedgerLabourHour).where(LedgerLabourHour.run_id == run.id)).all()
+    assert len(ledger) == 1
+
+
+def test_ledger_populate_case_insensitive(session, run):
+    """Alias matching should be case-insensitive."""
+    p = _make_person(session, run, "Alice Smith")
+    _make_confirmed_alias(session, run, p, "alice smith")
+    _make_timesheet_staging_row(session, run, "Alice Smith", total_hours=100.0, sred_hours=80.0)
+
+    result = _ledger_populate(session, run.id)
+    assert result["created"] == 1
+
+
+def test_ledger_populate_no_sred_hours(session, run):
+    """When SR&ED hours column is missing, bucket=UNSORTED and inclusion_fraction=1.0."""
+    p = _make_person(session, run, "Alice")
+    _make_confirmed_alias(session, run, p, "Alice")
+
+    raw = {
+        "Employee": "Alice",
+        "Salary Start Date": "2024-06-01",
+        "Total Working Hours": 160.0,
+    }
+    raw_json = json.dumps(raw)
+    sr = StagingRow(
+        run_id=run.id,
+        raw_data=raw_json,
+        row_hash=hashlib.sha256(raw_json.encode()).hexdigest(),
+        normalized_text="Alice 160h",
+        status=StagingStatus.PENDING,
+        row_type=StagingRowType.UNKNOWN,
+    )
+    session.add(sr)
+    session.commit()
+
+    result = _ledger_populate(session, run.id)
+    assert result["created"] == 1
+
+    ledger = session.exec(select(LedgerLabourHour).where(LedgerLabourHour.run_id == run.id)).first()
+    assert ledger.bucket == "UNSORTED"
+    assert ledger.inclusion_fraction == 1.0
+    assert ledger.hours == 160.0
